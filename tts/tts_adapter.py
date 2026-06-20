@@ -11,6 +11,7 @@ import array
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Optional, Callable
 from urllib.parse import urlparse
@@ -399,27 +400,108 @@ class KaggleGPTSoVitsAdapter(GPTSoVitsAdapter):
 
 
 class IndexTTSAdapter(TTSAdapter):
+    """Adapter for the IndexTTS / IndexTTS2 (https://github.com/index-tts/index-tts) text-to-speech service.
+
+    Supports both IndexTTS2 (v2, recommended) and IndexTTS (v1.5). Integration strategies:
+
+    1. **Local Python API** (preferred): Uses ``indextts.infer_v2.IndexTTS2`` (or ``indextts.infer.IndexTTS``)
+       directly in the current process. Requires ``indextts`` to be importable.
+    2. **Local Server** (``index_tts_work_path`` set): Spawns the IndexTTS webui or API server as a subprocess.
+    3. **Remote HTTP API** (``tts_server_url`` set): Calls an already-running IndexTTS service via HTTP.
+
+    IndexTTS2 enables emotion conditioning through three optional inputs:
+    ``emo_audio_prompt`` (emotional reference audio), ``emo_vector`` (8 floats in the order
+    [happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]) or ``emo_text``
+    (natural language emotion description).
     """
-    Adapter for a hypothetical Index TTS service.
-    This demonstrates how a new service can be integrated.
-    """
+
     def __init__(
         self,
-        index_server_url="http://localhost:9880/",
-        index_server_work_path=None,
         tts_server_url=None,
+        index_tts_work_path=None,
         gpt_sovits_work_path=None,
+        index_tts_model_dir: str = "checkpoints",
+        index_tts_cfg_path: str = "checkpoints/config.yaml",
+        index_tts_version: str = "v2",
+        index_tts_use_fp16: bool = False,
+        index_tts_use_cuda_kernel: bool = False,
+        index_tts_use_deepspeed: bool = False,
+        index_tts_device: str = "cuda",
+        **_ignored,
     ):
-        self.index_server_url = (tts_server_url or index_server_url).rstrip("/") + "/"
-        self.current_model = None
+        self.tts_server_url = (tts_server_url or "").strip()
+        self.index_tts_work_path = str(index_tts_work_path or gpt_sovits_work_path or "").strip() or None
+        self.model_dir = str(index_tts_model_dir or "checkpoints").strip()
+        self.cfg_path = str(index_tts_cfg_path or "checkpoints/config.yaml").strip()
+        raw_version = str(index_tts_version or "v2").strip().lower()
+        self.use_v2 = raw_version in {"v2", "indextts2", "index-tts2", "2"}
+        self.use_fp16 = bool(index_tts_use_fp16)
+        self.use_cuda_kernel = bool(index_tts_use_cuda_kernel)
+        self.use_deepspeed = bool(index_tts_use_deepspeed)
+        self.device = str(index_tts_device or "cuda").strip()
+
+        self._session = requests.Session()
         self._server_process = None
+        self._tts_instance = None
+        self._module_available = None
 
-        self.gpt_sovits_work_path = str(index_server_work_path or gpt_sovits_work_path or "").strip() or None
-
-        # Load the model and start the server process here
+        self._discover_best_mode()
         self._start_server_process()
 
+    # ------------------------------------------------------------------ #
+    # Discovery / lifecycle                                              #
+    # ------------------------------------------------------------------ #
+
+    @classmethod
+    def get_config_schema(cls) -> dict[str, dict]:
+        return {
+            "index_tts_work_path": {
+                "label": "IndexTTS 项目工作路径（可选，本地部署时填写）",
+                "type": "str",
+                "default": "",
+            },
+            "index_tts_model_dir": {
+                "label": "模型目录（相对工作路径或绝对路径）",
+                "type": "str",
+                "default": "checkpoints",
+            },
+            "index_tts_cfg_path": {
+                "label": "模型配置文件路径",
+                "type": "str",
+                "default": "checkpoints/config.yaml",
+            },
+            "index_tts_version": {
+                "label": "IndexTTS 版本（v2 / v1.5）",
+                "type": "str",
+                "default": "v2",
+            },
+            "index_tts_use_fp16": {
+                "label": "使用 FP16 半精度推理（降低显存，速度更快）",
+                "type": "bool",
+                "default": False,
+            },
+            "index_tts_use_cuda_kernel": {
+                "label": "启用编译 CUDA kernel（更快但需依赖）",
+                "type": "bool",
+                "default": False,
+            },
+            "index_tts_use_deepspeed": {
+                "label": "启用 DeepSpeed 加速",
+                "type": "bool",
+                "default": False,
+            },
+            "index_tts_device": {
+                "label": "推理设备（v1.5 有效）",
+                "type": "str",
+                "default": "cuda",
+            },
+        }
+
     def stop_server(self) -> None:
+        try:
+            self._session.close()
+        except Exception:
+            pass
         if self._server_process is not None:
             try:
                 self._server_process.terminate()
@@ -431,63 +513,298 @@ class IndexTTSAdapter(TTSAdapter):
                     pass
             self._server_process = None
 
-    def _start_server_process(self):
-        """
-        Starts the GPT-SoVITS server process if it's not running.
-        This is now the adapter's responsibility.
-        """
+    def _discover_best_mode(self) -> None:
+        """Detect the best available integration mode."""
         try:
-            # You might want to add a check here to see if the process is already running
-            response = requests.get(self.index_server_url, timeout=5)
-            if response.status_code == 200:
-                print("IndexTTS server is already running.")
-                return
+            if self.use_v2:
+                __import__("indextts.infer_v2")
+            else:
+                __import__("indextts.infer")
+            self._module_available = True
+        except Exception:
+            self._module_available = False
+
+    def _server_is_reachable(self) -> bool:
+        if not self.tts_server_url:
+            return False
+        try:
+            response = self._session.get(self.tts_server_url, timeout=5)
+            return 200 <= response.status_code < 500
         except requests.RequestException:
-            print("IndexTTS server not found, attempting to start...")
+            return False
 
-        if not self.gpt_sovits_work_path:
-            raise RuntimeError("Local IndexTTS server is not reachable; set the IndexTTS startup path.")
+    def _start_server_process(self) -> None:
+        """Starts an IndexTTS server subprocess when requested and the service is unreachable."""
+        if self._module_available:
+            print(f"IndexTTS{'2' if self.use_v2 else ''}: using in-process Python API.")
+            return
+        if self._server_is_reachable():
+            print(f"IndexTTS server reachable at {self.tts_server_url}; using HTTP API.")
+            return
 
-        os_path = self.gpt_sovits_work_path
-        embeded_python_path = os.path.join(os_path, "runtime", "python.exe")
-        api_path = os.path.join(os_path, "api_v2.py")
-        if not os.path.isfile(api_path):
-            raise FileNotFoundError(f"IndexTTS api_v2.py not found: {api_path}")
-        
-        # Use subprocess.Popen to start the server in the background
-        self._server_process = subprocess.Popen([embeded_python_path, api_path], cwd=os_path)
-        print("IndexTTS server starting...")
-    
-    def generate_speech(self, text, file_path=None, **kwargs):
-        """Generates speech using the Index TTS API."""
+        if not self.index_tts_work_path:
+            print(
+                "IndexTTS: no Python module, no reachable server, and no index_tts_work_path set; "
+                "synthesis attempts will fail."
+            )
+            return
+
+        work_path = Path(self.index_tts_work_path)
+        webui_script = work_path / "webui.py"
+        if not webui_script.is_file():
+            print(f"IndexTTS: webui.py not found in {work_path}; cannot auto-start.")
+            return
+
+        bundled_python = work_path / "runtime" / "python.exe"
+        python_path = str(bundled_python) if bundled_python.is_file() else sys.executable
+        args = [python_path, str(webui_script)]
         try:
-            params = {
-                "text": text,
-                "model_id": self.current_model,
-                "voice_name": kwargs.get("voice_name", "default"),
-                "language": kwargs.get("text_lang", "ja")
-            }
-            response = requests.post(self.index_server_url + "generate", json=params)
-            response.raise_for_status()
+            self._server_process = subprocess.Popen(
+                args,
+                cwd=str(work_path),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"IndexTTS server starting at {work_path.name} ...")
+        except Exception as exc:
+            print(f"IndexTTS failed to start subprocess: {exc}")
 
-            if not file_path:
-                file_path = "path_to_index_tts_file.wav"
+    # ------------------------------------------------------------------ #
+    # In-process Python API (IndexTTS2 / IndexTTS v1.5)                   #
+    # ------------------------------------------------------------------ #
 
-            with open(file_path, 'wb') as f:
-                f.write(response.content)
-
-            return os.path.abspath(file_path)
-        except Exception as e:
-            print(f"Index TTS generation failed: {e}")
+    def _ensure_instance(self):
+        if self._tts_instance is not None:
+            return self._tts_instance
+        if not self._module_available:
             return None
 
+        try:
+            if self.use_v2:
+                from indextts.infer_v2 import IndexTTS2
+
+                self._tts_instance = IndexTTS2(
+                    cfg_path=self.cfg_path,
+                    model_dir=self.model_dir,
+                    use_fp16=self.use_fp16,
+                    use_cuda_kernel=self.use_cuda_kernel,
+                    use_deepspeed=self.use_deepspeed,
+                )
+                print("IndexTTS2 instance loaded.")
+            else:
+                from indextts.infer import IndexTTS
+
+                self._tts_instance = IndexTTS(
+                    model_dir=self.model_dir,
+                    cfg_path=self.cfg_path,
+                    device=self.device,
+                )
+                print("IndexTTS v1.5 instance loaded.")
+            return self._tts_instance
+        except Exception as exc:
+            print(f"IndexTTS failed to load in-process model: {exc}")
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Synthesis                                                          #
+    # ------------------------------------------------------------------ #
+
+    def generate_speech(self, text, file_path=None, **kwargs):
+        """Generate TTS audio using IndexTTS.
+
+        ``kwargs`` recognised by this adapter:
+
+        - ``ref_audio_path``: speaker reference audio (required).
+        - ``text``: synthesis text (already passed positionally).
+        - ``text_lang``: synthesis language (informational).
+        - ``prompt_text`` / ``prompt_lang``: optional reference text/language
+          (used to enrich the synthesis prompt for v1.5 and translated to
+          ``emo_text`` for v2 when no explicit ``emo_text`` is provided).
+        - ``speed_factor``: v1.5 speed multiplier (default 1.0).
+        - ``emo_audio_prompt``: emotional reference audio (v2 only).
+        - ``emo_alpha``: emotion intensity in ``[0.0, 1.0]`` (v2 only).
+        - ``emo_vector``: 8 floats vector (v2 only).
+        - ``emo_text``: text-based emotion description (v2 only).
+        - ``use_random``: enable sampling randomness (v2 only).
+        """
+        text = str(text or "").strip()
+        if not text:
+            print("IndexTTS: empty text, skipping.")
+            return None
+
+        out_path = Path(file_path) if file_path else Path(tempfile.mkdtemp()) / "indextts_output.wav"
+        out_path = Path(os.path.abspath(str(out_path)))
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        ref_audio_path = kwargs.get("ref_audio_path") or ""
+        try:
+            ref_audio_path = str(Path(ref_audio_path).resolve()) if ref_audio_path else ""
+        except OSError:
+            ref_audio_path = str(ref_audio_path)
+
+        # 1) In-process Python API ---------------------------------------------------
+        if self._module_available:
+            instance = self._ensure_instance()
+            if instance is not None:
+                try:
+                    if self.use_v2:
+                        emo_audio_prompt = kwargs.get("emo_audio_prompt") or ""
+                        emo_alpha = kwargs.get("emo_alpha", 1.0)
+                        emo_vector = kwargs.get("emo_vector") or None
+                        emo_text = kwargs.get("emo_text") or kwargs.get("prompt_text") or ""
+                        use_random = bool(kwargs.get("use_random", False))
+                        instance.infer(
+                            spk_audio_prompt=ref_audio_path or None,
+                            text=text,
+                            output_path=str(out_path),
+                            emo_audio_prompt=str(emo_audio_prompt) or None,
+                            emo_alpha=float(emo_alpha),
+                            emo_vector=list(emo_vector) if emo_vector else None,
+                            emo_text=str(emo_text) or None,
+                            use_random=use_random,
+                            verbose=False,
+                        )
+                    else:
+                        speed = float(kwargs.get("speed_factor") or 1.0)
+                        instance.infer(
+                            voice=ref_audio_path or None,
+                            text=text,
+                            output_path=str(out_path),
+                            speed=speed,
+                            verbose=False,
+                        )
+                    if out_path.is_file() and out_path.stat().st_size > 0:
+                        return str(out_path)
+                    print("IndexTTS: in-process generation produced no file.")
+                except Exception as exc:
+                    print(f"IndexTTS in-process generation failed: {exc}")
+
+        # 2) HTTP API fallback (if a server is reachable) ----------------------------
+        if self._server_is_reachable():
+            try:
+                response = self._session.post(
+                    self.tts_server_url.rstrip("/") + "/api/tts",
+                    json={
+                        "text": text,
+                        "speaker_audio": ref_audio_path,
+                        "version": "v2" if self.use_v2 else "v1.5",
+                        "language": kwargs.get("text_lang") or "zh",
+                    },
+                    timeout=300,
+                )
+                if response.ok:
+                    with open(out_path, "wb") as f:
+                        f.write(response.content)
+                    if out_path.is_file() and out_path.stat().st_size > 0:
+                        return str(out_path)
+                print(f"IndexTTS HTTP API returned status={response.status_code}")
+            except Exception as exc:
+                print(f"IndexTTS HTTP API call failed: {exc}")
+
+        # 3) Subprocess fallback ------------------------------------------------------
+        if self.index_tts_work_path:
+            return self._generate_via_subprocess(text, ref_audio_path, str(out_path), **kwargs)
+
+        return None
+
+    def _generate_via_subprocess(self, text: str, ref_audio_path: str, out_path: str, **kwargs) -> str | None:
+        """Invoke IndexTTS via a short-lived Python subprocess when a work path is provided."""
+        work_path = Path(self.index_tts_work_path)
+        bundled_python = work_path / "runtime" / "python.exe"
+        python_path = str(bundled_python) if bundled_python.is_file() else sys.executable
+
+        # Build a tiny inline script that imports the right IndexTTS entry and calls infer.
+        if self.use_v2:
+            script_lines = [
+                "import sys, os",
+                f"sys.path.insert(0, {str(work_path)!r})",
+                "from indextts.infer_v2 import IndexTTS2",
+                "tts = IndexTTS2(",
+                f"    cfg_path={self.cfg_path!r}, model_dir={self.model_dir!r},",
+                f"    use_fp16={self.use_fp16}, use_cuda_kernel={self.use_cuda_kernel},",
+                f"    use_deepspeed={self.use_deepspeed})",
+                "tts.infer(",
+                f"    spk_audio_prompt={ref_audio_path or None!r},",
+                f"    text={text!r},",
+                f"    output_path={out_path!r}, verbose=False)",
+            ]
+        else:
+            speed = float(kwargs.get("speed_factor") or 1.0)
+            script_lines = [
+                "import sys, os",
+                f"sys.path.insert(0, {str(work_path)!r})",
+                "from indextts.infer import IndexTTS",
+                "tts = IndexTTS(",
+                f"    model_dir={self.model_dir!r}, cfg_path={self.cfg_path!r},",
+                f"    device={self.device!r})",
+                "tts.infer(",
+                f"    voice={ref_audio_path or None!r},",
+                f"    text={text!r},",
+                f"    output_path={out_path!r},",
+                f"    speed={speed}, verbose=False)",
+            ]
+        script = "\n".join(script_lines)
+        try:
+            completed = subprocess.run(
+                [python_path, "-c", script],
+                cwd=str(work_path),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if completed.returncode != 0:
+                print(f"IndexTTS subprocess failed (rc={completed.returncode}): {completed.stderr[:4000]}")
+                return None
+            if Path(out_path).is_file() and Path(out_path).stat().st_size > 0:
+                return out_path
+        except Exception as exc:
+            print(f"IndexTTS subprocess execution failed: {exc}")
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Model switching                                                     #
+    # ------------------------------------------------------------------ #
+
     def switch_model(self, model_info):
-        """Switches the model for the Index TTS service."""
-        model_id = model_info.get("model_id")
-        if model_id and self.current_model != model_id:
-            print(f"Switching to Index TTS model: {model_id}")
-            # You can add a check or call an API endpoint here to verify the model
-            self.current_model = model_id
+        """Switch IndexTTS model paths or runtime options.
+
+        ``model_info`` keys:
+        - ``model_dir`` / ``cfg_path``: checkpoint and config path.
+        - ``use_v2`` / ``version``: switch between v2 and v1.5.
+        - ``use_fp16``, ``use_cuda_kernel``, ``use_deepspeed``.
+        - ``device``: v1.5 device.
+        """
+        info = model_info or {}
+        changed = False
+
+        if "model_dir" in info and str(info["model_dir"]).strip():
+            self.model_dir = str(info["model_dir"]).strip()
+            changed = True
+        if "cfg_path" in info and str(info["cfg_path"]).strip():
+            self.cfg_path = str(info["cfg_path"]).strip()
+            changed = True
+        for key, attr in (
+            ("use_fp16", "use_fp16"),
+            ("use_cuda_kernel", "use_cuda_kernel"),
+            ("use_deepspeed", "use_deepspeed"),
+        ):
+            if key in info:
+                setattr(self, attr, bool(info[key]))
+                changed = True
+        if "device" in info and str(info["device"]).strip():
+            self.device = str(info["device"]).strip()
+            changed = True
+        if "use_v2" in info or "version" in info:
+            version = str(info.get("use_v2") or info.get("version") or "").strip().lower()
+            new_v2 = version in {"v2", "indextts2", "index-tts2", "2", "true"}
+            if new_v2 != self.use_v2:
+                self.use_v2 = new_v2
+                changed = True
+
+        if changed and self._tts_instance is not None:
+            print("IndexTTS reloading instance after model switch.")
+            self._tts_instance = None
+            self._ensure_instance()
 
 class CosyVoiceAdapter(TTSAdapter):
     """
