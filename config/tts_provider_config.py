@@ -5,12 +5,17 @@ from urllib.parse import urlparse
 
 LEGACY_DEFAULT_TTS_SERVER_URL = "http://127.0.0.1:9880"
 DEFAULT_TTS_SERVER_URL = "https://127.0.0.1:9880"
+INDEX_TTS_DEFAULT_URL = "http://127.0.0.1:7860"
 TTS_PROVIDER_DEFAULT_URLS = {
     "genie-tts": DEFAULT_TTS_SERVER_URL,
     "gpt-sovits": DEFAULT_TTS_SERVER_URL,
-    "index-tts": LEGACY_DEFAULT_TTS_SERVER_URL,
+    "index-tts": INDEX_TTS_DEFAULT_URL,
 }
-BUILTIN_TTS_SERVER_URLS = {LEGACY_DEFAULT_TTS_SERVER_URL, DEFAULT_TTS_SERVER_URL}
+BUILTIN_TTS_SERVER_URLS = {
+    LEGACY_DEFAULT_TTS_SERVER_URL,
+    DEFAULT_TTS_SERVER_URL,
+    INDEX_TTS_DEFAULT_URL,
+}
 INSTALLED_TTS_BUNDLES_PATH = Path("data/tts_bundles/installed")
 REMOTE_TTS_PROVIDERS = {"kaggle-gpt-sovits"}
 LOCAL_SERVER_TTS_PROVIDERS = {"gpt-sovits", "genie-tts", "index-tts"}
@@ -18,6 +23,7 @@ SERVER_CONFIG_TTS_PROVIDERS = LOCAL_SERVER_TTS_PROVIDERS | REMOTE_TTS_PROVIDERS
 TTS_PROVIDER_BUNDLE_KEYS: dict[str, tuple[str, ...]] = {
     "genie-tts": ("genie_tts_server",),
     "gpt-sovits": ("gpt_sovits_v2pro", "gpt_sovits_nvidia50"),
+    "index-tts": ("index_tts_v2", "index_tts_v1.5"),
 }
 
 
@@ -75,6 +81,13 @@ def _is_valid_bundle_root(provider: str, path: Path) -> bool:
         return (path / "api_v2.py").is_file()
     if provider == "genie-tts":
         return (path / "start.py").is_file() and (path / "runtime").is_dir()
+    if provider == "index-tts":
+        # index-tts bundle must contain either webui.py or an indextts Python package folder
+        return (
+            (path / "webui.py").is_file()
+            or (path / "indextts").is_dir()
+            or (path / "pyproject.toml").is_file()
+        )
     return False
 
 
